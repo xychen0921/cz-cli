@@ -66,6 +66,41 @@
 - **THEN** 输出 `has_more` 为 `false`
 - **且** 不输出翻页提示 `ai_message`
 
+### Requirement: service strict-ready 快速检查 strict/KB 索引能力
+
+`cz-cli analytics-agent service strict-ready` MUST 使用 Analytics Agent Open API 的索引状态接口做低成本 readiness 检查，用于判断当前 profile/endpoint 是否适合继续调用 `analytics-agent session dryrun` 以及依赖 metric/answer-builder 系统知识库索引的命令。命令 MUST 要求 `--domain-id`，MAY 接受可重复的 `--metric-id` 和 `--answer-builder-id`；未显式提供资源 id 时，CLI SHOULD 分别从 metric list 与 answer-builder list 各取 1 条样本再检查索引状态。
+
+输出 MUST 包含 `ready`、`status`、`domain_id`、`checks` 与 `ai_message`。当远端不支持索引状态 API（HTTP 404/405/501 或业务错误表明 not found / unsupported）时，CLI MUST 返回 `ready=false`、`status=UNSUPPORTED`，并通过 `ai_message` 明确指导本地 agent：当前 endpoint/profile 可能未开启白名单或后端版本不支持，不要继续使用 `session dryrun` 与 KB index 相关命令。
+
+#### Scenario: 显式 metric 已索引时返回 ready
+
+- **WHEN** 用户执行 `cz-cli analytics-agent service strict-ready --domain-id 195 --metric-id 568`
+- **AND** 远端索引状态接口返回该 metric 已索引
+- **THEN** CLI MUST 调用 `POST /open/api/v1/analytics-agent/index/status`
+- **且** 请求体包含 `type=metric`、`id=568`、`domainId=195`、`includeContent=false`
+- **AND** 输出 `ready=true`、`status=READY`
+
+#### Scenario: 显式 answer-builder 未索引时指导 agent 绕过
+
+- **WHEN** 用户执行 `cz-cli analytics-agent service strict-ready --domain-id 195 --answer-builder-id 9`
+- **AND** 远端索引状态接口返回该 answer-builder 未索引
+- **THEN** CLI MUST 输出 `ready=false`、`status=NOT_READY`
+- **AND** `ai_message` MUST 指导本地 agent 避免对该 profile/endpoint 使用 strict dryrun 与 KB index 相关命令，直到白名单/索引完成
+
+#### Scenario: 未提供 id 时自动抽样检查
+
+- **WHEN** 用户执行 `cz-cli analytics-agent service strict-ready --domain-id 195`
+- **THEN** CLI SHOULD 调用 metric list 与 answer-builder list 获取样本
+- **AND** 对能获取到的样本调用索引状态接口
+- **AND** 根据样本索引结果输出 `READY` 或 `NOT_READY`
+
+#### Scenario: 无可检查样本时返回 NO_SAMPLE
+
+- **WHEN** 用户执行 `cz-cli analytics-agent service strict-ready --domain-id 195`
+- **AND** 当前 domain 没有可抽样的 metric 或 answer-builder
+- **THEN** CLI MUST 输出 `ready=false`、`status=NO_SAMPLE`
+- **AND** `ai_message` MUST 指导本地 agent 不要仅凭该结果使用 strict dryrun，除非用户提供具体 metric/answer-builder id 再检查
+
 ### Requirement: 输出字段面向用户和 agent
 
 本需求 MUST 按以下场景执行。

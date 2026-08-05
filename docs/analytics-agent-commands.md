@@ -213,11 +213,27 @@ cz-cli analytics-agent knowledge file upload 1 ./manual.md --target-path /sales 
 | 命令 | 说明 | 关键参数 |
 | --- | --- | --- |
 | `analytics-agent service enabled` | 检查当前 tenant 是否启用 Analytics Agent | 无 |
+| `analytics-agent service strict-ready` | 快速检查当前 profile/endpoint 是否可安全使用 strict dryrun 与 KB index 相关命令 | `--domain-id`、`--metric-id`、`--answer-builder-id`、`--include-content` |
 | `analytics-agent session list` | 列出 text2insight 会话 | `--domain-id`、`--source-type`、`--source-id` |
 | `analytics-agent session create` | 创建安全 text2insight 会话 | `--domain-id`、`--title`、`--source-type`、`--source-id` |
 | `analytics-agent session run` | 发起问题并等待结果 | `--domain-id`、`--session-id`、`--msg`、`--model-name`、`--model-setting KEY=VALUE`（可重复）、`--interval-ms`、`--timeout-ms`、`--summary` |
+| `analytics-agent session dryrun` | 发起 strict ask-data dryrun async 并默认轮询结果 | `--domain-id`、`--question`、`--session-id`、`--question-id`、`--model`、`--model-identifier`、`--language`、`--validate-selected-candidate`、`--ask-data-scope`、`--no-wait` |
 | `analytics-agent session result <question-id>` | 查询问题结果 | `--wait`、`--interval-ms`、`--timeout-ms` |
 | `analytics-agent session stop [session-id] [question-id]` | 停止运行中的问题 | `[session-id]`、`[question-id]` |
+
+示例：
+
+```bash
+cz-cli analytics-agent service strict-ready --domain-id 195 --metric-id 568
+cz-cli analytics-agent service strict-ready --domain-id 195 --answer-builder-id 9
+cz-cli analytics-agent service strict-ready --domain-id 195
+cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量" --validate-selected-candidate
+cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量" --ask-data-scope '{"mode":"INCLUDE","metrics":[{"metricId":568}]}' --no-wait
+```
+
+`service strict-ready` 使用 `/open/api/v1/analytics-agent/index/status` 做低成本探测。若指定 `--metric-id` / `--answer-builder-id`，会直接检查这些资源；若未指定，会在当前 domain 中各抽样 1 个 metric 与 answer-builder 检查。返回 `status=UNSUPPORTED` 表示当前远端可能未开启白名单或后端不支持索引状态 API，本地 agent 应避免继续使用 `session dryrun` 与 KB index 相关命令；返回 `status=NO_SAMPLE` 表示没有可检查样本，需要提供具体资源 id 后再判断。
+
+`session dryrun` 使用后端现有 async dryrun API。若远端服务尚未支持该 API，命令会返回 `ANALYTICS_AGENT_DRYRUN_UNSUPPORTED`，并在 `ai_message` 中提示 agent 不要继续使用该命令；若 poll 返回 `NOT_FOUND`，通常表示任务内存态命中了错误实例或服务重启，按 `ai_message` 重试一次即可。
 
 示例：
 

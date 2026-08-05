@@ -108,3 +108,53 @@
 
 - **WHEN** 用户执行 `cz-cli analytics-agent session run --help`
 - **THEN** help 中不包含 `--body`
+
+### Requirement: session dryrun 使用 strict ask-data async dryrun API
+
+`cz-cli analytics-agent session dryrun` MUST 调用现有 strict ask-data dryrun async API，不新增或依赖新的后端 API。命令 MUST 使用显式参数组装请求体，并默认轮询 async job 直到 `SUCCESS`、`FAILED`、`TIMEOUT` 或 `NOT_FOUND`；用户 MAY 使用 `--no-wait` 只提交任务并返回提交响应。`--question` 为主问题参数，`--query` 作为兼容别名；两者至少提供一个且非空。`--ask-data-scope` 若提供，MUST 是 JSON object。
+
+当远端服务不支持 dryrun async API（例如 submit 或 poll 返回 HTTP 404/405/501，或业务错误表明 not found / unsupported）时，CLI MUST 返回稳定错误码 `ANALYTICS_AGENT_DRYRUN_UNSUPPORTED`，并通过 `ai_message` 明确指导本地 agent：当前 endpoint/profile 不要再调用 `analytics-agent session dryrun`，改用 `analytics-agent session run` 或跳过 strict dryrun 校验，直到后端升级。
+
+当 poll 返回 `NOT_FOUND` 时，CLI MUST 保留后端 job payload，同时通过 `ai_message` 指出这可能是请求被负载均衡到错误后端实例、后端重启、或内存任务过期导致，并指导本地 agent 对同一个 dryrun 命令重试一次；如果重复出现，应避免在当前非粘性/多实例 endpoint 上继续使用该命令。
+
+#### Scenario: dryrun 提交并轮询 strict async job
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量" --session-id 7 --validate-selected-candidate --ask-data-scope '{"mode":"INCLUDE","metrics":[{"metricId":568}]}'`
+- **THEN** CLI MUST 先调用 `POST /open/text2insight/dryrun/async`
+- **且** 请求体包含 `domainId`、`sessionId`、`question`、`validateSelectedCandidate`、`askDataScope`
+- **AND** CLI MUST 使用返回的 `jobId` 调用 `POST /open/text2insight/dryrun/async/poll`
+- **AND** 最终输出 MUST 是 poll API 返回的 job payload
+
+#### Scenario: dryrun 只提交不轮询
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量" --no-wait`
+- **THEN** CLI MUST 只调用 `POST /open/text2insight/dryrun/async`
+- **AND** 输出 MUST 是 submit API 返回的 job summary
+
+#### Scenario: dryrun 缺少问题时本地拒绝
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "   "`
+- **THEN** CLI MUST 在本地直接返回 `USAGE_ERROR`
+- **且** 错误信息 MUST 明确说明 `--question must be non-empty`
+
+#### Scenario: dryrun 传入非法 ask-data-scope 时本地拒绝
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量" --ask-data-scope '[]'`
+- **THEN** CLI MUST 在本地直接返回 `USAGE_ERROR`
+- **且** 错误信息 MUST 明确说明 `--ask-data-scope must be a JSON object`
+
+#### Scenario: dryrun 远端不支持时指导 agent 绕过
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量"`
+- **AND** submit 或 poll API 返回 HTTP 404
+- **THEN** CLI MUST 返回 `ANALYTICS_AGENT_DRYRUN_UNSUPPORTED`
+- **AND** `ai_message` MUST 指导本地 agent 不要再对当前 endpoint/profile 调用 `analytics-agent session dryrun`
+- **AND** `ai_message` MUST 建议改用 `analytics-agent session run` 或跳过 strict dryrun 校验
+
+#### Scenario: dryrun poll 命中错误实例时指导 agent 重试
+
+- **WHEN** 用户执行 `cz-cli analytics-agent session dryrun --domain-id 195 --question "昨天订单量"`
+- **AND** poll API 返回 job status `NOT_FOUND`
+- **THEN** CLI MUST 输出该 job payload
+- **AND** `ai_message` MUST 指出可能命中了不同 backend instance
+- **AND** `ai_message` MUST 指导本地 agent 重试同一个 dryrun 命令一次

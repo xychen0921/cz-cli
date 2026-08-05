@@ -39,6 +39,7 @@ const ROUTES = {
   answerBuilderEnable: { method: "POST", path: "/open/api/v1/analytics-agent/answer-builders/enable" },
   answerBuilderDisable: { method: "POST", path: "/open/api/v1/analytics-agent/answer-builders/disable" },
   datagptEnabled: { method: "GET", path: "/open/api/v1/analytics-agent/datagpt/enabled" },
+  indexStatus: { method: "POST", path: "/open/api/v1/analytics-agent/index/status" },
   domainList: { method: "GET", path: "/open/api/v1/analytics-agent/domains" },
   domainCreate: { method: "POST", path: "/open/api/v1/analytics-agent/domains" },
   domainUpdate: { method: "PUT", path: (argv: Record<string, unknown>) => `/open/api/v1/analytics-agent/domains/${encodePath(argv["domain-id"])}` },
@@ -89,6 +90,8 @@ const ROUTES = {
   sessionRun: { method: "POST", path: "/open/text2insight/query", openSessionAuth: true },
   sessionResult: { method: "POST", path: "/open/safe_question_poll", openSessionAuth: true },
   sessionStop: { method: "POST", path: "/open/text2insight/stop", openSessionAuth: true },
+  sessionDryrunAsync: { method: "POST", path: "/open/text2insight/dryrun/async", openSessionAuth: true },
+  sessionDryrunPoll: { method: "POST", path: "/open/text2insight/dryrun/async/poll", openSessionAuth: true },
 } as const
 
 type AnalyticsRoute = {
@@ -1296,6 +1299,231 @@ function isTerminalResponse(payload: unknown): boolean {
   return ["finish", "finish_stop", "error"].includes(latestResponseDataType(payload))
 }
 
+function dryrunJobStatus(payload: unknown): string {
+  const data = unwrapResponse(payload)
+  if (!data || typeof data !== "object" || Array.isArray(data)) return ""
+  const status = (data as Record<string, unknown>).status
+  return typeof status === "string" ? status : ""
+}
+
+function isTerminalDryrunJob(payload: unknown): boolean {
+  return ["SUCCESS", "FAILED", "TIMEOUT", "NOT_FOUND"].includes(dryrunJobStatus(payload))
+}
+
+function dryrunJobId(payload: unknown): string | undefined {
+  const data = unwrapResponse(payload)
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
+  const jobId = (data as Record<string, unknown>).jobId
+  return typeof jobId === "string" && jobId.trim() !== "" ? jobId : undefined
+}
+
+function withAiMessage(payload: unknown, aiMessage: string | undefined): unknown {
+  if (!aiMessage) return payload
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { data: payload, ai_message: aiMessage }
+  }
+  return { ...(payload as Record<string, unknown>), ai_message: aiMessage }
+}
+
+function isUnsupportedDryrunEndpoint(err: unknown): err is AnalyticsHttpError {
+  if (!(err instanceof AnalyticsHttpError)) return false
+  return [404, 405, 501].includes(err.request.status ?? 0)
+}
+
+function dryrunUnsupportedAiMessage(): string {
+  return "Remote Analytics Agent service does not support strict dryrun async APIs. Do not call `analytics-agent session dryrun` again for this endpoint/profile until the backend is upgraded; use `analytics-agent session run` or skip strict dryrun validation."
+}
+
+function isUnsupportedDryrunBusinessError(value: { code: string; message: string }): boolean {
+  const code = String(value.code).toUpperCase()
+  const message = value.message.toLowerCase()
+  return ["404", "405", "501", "NOT_FOUND", "METHOD_NOT_ALLOWED"].includes(code)
+    || message.includes("not found")
+    || message.includes("no handler")
+    || message.includes("not support")
+    || message.includes("unsupported")
+}
+
+function dryrunJobAiMessage(payload: unknown): string | undefined {
+  if (dryrunJobStatus(payload) !== "NOT_FOUND") return undefined
+  return "Dryrun job was not found. The poll may have reached a different backend instance, or the in-memory job expired after a restart. Retry the same `analytics-agent session dryrun` command once; if it repeats, avoid this command on the current non-sticky/multi-instance endpoint."
+}
+
+type IndexResourceType = "metric" | "answer-builder"
+
+interface IndexCheckTarget {
+  type: IndexResourceType
+  id: number
+  name?: string
+  sampled?: boolean
+}
+
+function isUnsupportedIndexEndpoint(err: unknown): err is AnalyticsHttpError {
+  if (!(err instanceof AnalyticsHttpError)) return false
+  return [404, 405, 501].includes(err.request.status ?? 0)
+}
+
+function isUnsupportedIndexBusinessError(value: { code: string; message: string }): boolean {
+  const code = String(value.code).toUpperCase()
+  const message = value.message.toLowerCase()
+  return ["404", "405", "501", "NOT_FOUND", "METHOD_NOT_ALLOWED"].includes(code)
+    || message.includes("not found")
+    || message.includes("no handler")
+    || message.includes("not support")
+    || message.includes("unsupported")
+}
+
+function strictReadyUnsupportedAiMessage(): string {
+  return "Remote Analytics Agent service does not support the index status API, or this tenant/profile is not whitelist-enabled. Do not call `analytics-agent session dryrun` or KB index commands for this endpoint/profile; use normal `analytics-agent session run` or ask backend/tenant admin to enable the whitelist first."
+}
+
+function strictReadyNotReadyAiMessage(): string {
+  return "At least one checked metric or answer-builder is not indexed in the system knowledge space. Do not call `analytics-agent session dryrun` or KB index commands for this endpoint/profile until the whitelist/index job is enabled and completed."
+}
+
+function strictReadyNoSampleAiMessage(): string {
+  return "No metric or answer-builder sample was available to verify whitelist-backed indexing. Do not assume strict dryrun is ready; rerun `analytics-agent service strict-ready` with --metric-id or --answer-builder-id before using `analytics-agent session dryrun` or KB index commands."
+}
+
+function strictReadyReadyAiMessage(): string {
+  return "Checked metric/answer-builder indexes are available. The local agent may use `analytics-agent session dryrun` and KB index commands for this endpoint/profile."
+}
+
+function firstRecord(value: unknown): Record<string, unknown> | undefined {
+  if (Array.isArray(value)) {
+    const found = value.find((item) => item && typeof item === "object" && !Array.isArray(item))
+    return found as Record<string, unknown> | undefined
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const candidates = [record.list, record.records, record.items, record.rows, record.data]
+  const found = candidates
+    .filter((item): item is unknown[] => Array.isArray(item))
+    .flat()
+    .find((item) => item && typeof item === "object" && !Array.isArray(item))
+  return found as Record<string, unknown> | undefined
+}
+
+function firstNumberField(record: Record<string, unknown>, fields: string[]): number | undefined {
+  return fields.map((field) => numberValue(record[field])).find((value) => value !== undefined)
+}
+
+function firstStringField(record: Record<string, unknown>, fields: string[]): string | undefined {
+  return fields
+    .map((field) => record[field])
+    .find((value): value is string => typeof value === "string" && value.trim() !== "")
+}
+
+async function sampleIndexTarget(
+  argv: Record<string, unknown>,
+  type: IndexResourceType,
+  domainId: number,
+  ctx: ResolvedContext,
+): Promise<IndexCheckTarget | undefined> {
+  const data = await requestAnalyticsData(
+    argv,
+    type === "metric" ? ROUTES.simpleMetricList : ROUTES.answerBuilderList,
+    { domainIds: [domainId], pageNum: 1, pageSize: 1 },
+    {},
+    ctx,
+  )
+  const record = firstRecord(data)
+  if (!record) return undefined
+  const id = firstNumberField(record, type === "metric" ? ["id", "metricId"] : ["id", "analysisId"])
+  if (!id) return undefined
+  return {
+    type,
+    id,
+    sampled: true,
+    name: firstStringField(record, type === "metric" ? ["name", "metricName"] : ["analysisName", "name"]),
+  }
+}
+
+function indexCheckResult(target: IndexCheckTarget, data: unknown): Record<string, unknown> {
+  const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {}
+  const status = typeof record.status === "string" ? record.status.toUpperCase() : undefined
+  const indexed = typeof record.indexed === "boolean"
+    ? record.indexed
+    : typeof record.isIndexed === "boolean"
+      ? record.isIndexed
+      : status === "INDEXED" || status === "SUCCESS" || status === "READY"
+  return mergeBody({
+    type: target.type,
+    id: target.id,
+    indexed,
+    status: indexed ? "INDEXED" : "NOT_INDEXED",
+  }, {
+    name: target.name,
+    sampled: target.sampled,
+    space_id: record.spaceId ?? record.spaceID ?? record.kbSpaceId ?? record.systemSpaceId,
+    node_id: record.nodeId ?? record.kbNodeId,
+    path: record.path ?? record.nodePath,
+  })
+}
+
+async function runStrictReadyCommand(argv: Record<string, unknown>): Promise<void> {
+  const format = typeof argv.format === "string" ? argv.format : "json"
+  const t0 = Date.now()
+  const domainId = requiredPositiveIntegerValue(argv["domain-id"], "--domain-id", format)
+  const includeContent = argv["include-content"] === true
+  try {
+    const ctx = await resolveAnalyticsContext(argv)
+    const explicitTargets = [
+      ...(positiveIntegerArray(argv["metric-id"], "--metric-id", format) ?? []).map((id) => ({ type: "metric" as const, id })),
+      ...(positiveIntegerArray(argv["answer-builder-id"], "--answer-builder-id", format) ?? []).map((id) => ({ type: "answer-builder" as const, id })),
+    ]
+    const targets = explicitTargets.length > 0
+      ? explicitTargets
+      : (await Promise.all([
+        sampleIndexTarget(argv, "metric", domainId, ctx),
+        sampleIndexTarget(argv, "answer-builder", domainId, ctx),
+      ])).filter((target): target is IndexCheckTarget => target !== undefined)
+
+    if (targets.length === 0) {
+      const data = { ready: false, status: "NO_SAMPLE", domain_id: domainId, checks: [] }
+      logOperation("analytics-agent service strict-ready", { ok: true, timeMs: Date.now() - t0 })
+      success(data, { format, timeMs: Date.now() - t0, aiMessage: strictReadyNoSampleAiMessage() })
+      return
+    }
+
+    const checks = await Promise.all(targets.map(async (target) => {
+      const payload = await requestAnalytics(argv, ROUTES.indexStatus, {
+        type: target.type,
+        id: target.id,
+        domainId,
+        includeContent,
+      }, {}, ctx)
+      const bizErr = extractBusinessError(payload)
+      if (bizErr) throw new AnalyticsBusinessError(bizErr.code, bizErr.message)
+      return indexCheckResult(target, unwrapResponse(payload))
+    }))
+    const ready = checks.every((check) => check.indexed === true)
+    const data = { ready, status: ready ? "READY" : "NOT_READY", domain_id: domainId, checks }
+    logOperation("analytics-agent service strict-ready", { ok: true, timeMs: Date.now() - t0 })
+    success(data, {
+      format,
+      timeMs: Date.now() - t0,
+      aiMessage: ready ? strictReadyReadyAiMessage() : strictReadyNotReadyAiMessage(),
+    })
+  } catch (err) {
+    logOperation("analytics-agent service strict-ready", { ok: false, timeMs: Date.now() - t0 })
+    if (isHandledCliError(err)) return
+    if (isUnsupportedIndexEndpoint(err) || (err instanceof AnalyticsBusinessError && isUnsupportedIndexBusinessError(err))) {
+      success(
+        { ready: false, status: "UNSUPPORTED", domain_id: domainId, checks: [] },
+        { format, timeMs: Date.now() - t0, aiMessage: strictReadyUnsupportedAiMessage() },
+      )
+      return
+    }
+    const message = err instanceof AnalyticsBusinessError ? err.message : err instanceof Error ? err.message : String(err)
+    const code = err instanceof AnalyticsBusinessError ? err.code : "ANALYTICS_AGENT_ERROR"
+    error(code, message, {
+      format,
+      ...(err instanceof AnalyticsHttpError ? { extra: { request: err.request } } : {}),
+    })
+  }
+}
+
 function extractModelMessage(entry: unknown): string | undefined {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined
   const e = entry as Record<string, unknown>
@@ -1461,6 +1689,91 @@ async function executeSessionRunCommand(
   } catch (err) {
     logOperation(name, { ok: false, timeMs: Date.now() - t0 })
     if (isHandledCliError(err)) return
+    error("ANALYTICS_AGENT_ERROR", err instanceof Error ? err.message : String(err), {
+      format,
+      ...(err instanceof AnalyticsHttpError ? { extra: { request: err.request } } : {}),
+    })
+  }
+}
+
+async function executeSessionDryrunCommand(
+  name: string,
+  argv: Record<string, unknown>,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const format = typeof argv.format === "string" ? argv.format : undefined
+  const field = typeof argv.field === "string" ? argv.field : undefined
+  const wait = argv.wait !== false
+  const timeoutMs = typeof argv["timeout-ms"] === "number" ? argv["timeout-ms"] : 300_000
+  const intervalMs = typeof argv["interval-ms"] === "number" ? argv["interval-ms"] : 2_000
+  const t0 = Date.now()
+  try {
+    const ctx = await resolveAnalyticsContext(argv)
+    const submitPayload = await requestAnalytics(argv, ROUTES.sessionDryrunAsync, body, {}, ctx)
+    const bizErr = extractBusinessError(submitPayload)
+    if (bizErr) {
+      logOperation(name, { ok: false, timeMs: Date.now() - t0 })
+      if (isUnsupportedDryrunBusinessError(bizErr)) {
+        error("ANALYTICS_AGENT_DRYRUN_UNSUPPORTED", "Remote service does not support strict dryrun async APIs", {
+          format,
+          aiMessage: dryrunUnsupportedAiMessage(),
+        })
+        return
+      }
+      error(bizErr.code, bizErr.message, { format })
+      return
+    }
+    const jobId = dryrunJobId(submitPayload)
+    if (!wait) {
+      logOperation(name, { ok: true, timeMs: Date.now() - t0 })
+      writeRenderedPayload(submitPayload, format, field)
+      return
+    }
+    if (!jobId) {
+      logOperation(name, { ok: false, timeMs: Date.now() - t0 })
+      error("ANALYTICS_AGENT_ERROR", "dryrun async did not return a jobId", { format, extra: { response: unwrapResponse(submitPayload) } })
+      return
+    }
+
+    const pollBody = { jobId }
+    const deadline = Date.now() + timeoutMs
+    let payload = submitPayload
+    const spinner = startSpinner("Strict dryrun 正在生成执行计划")
+    try {
+      do {
+        payload = await requestAnalytics(argv, ROUTES.sessionDryrunPoll, pollBody, {}, ctx)
+        if (isTerminalDryrunJob(payload) || Date.now() >= deadline) break
+        await Bun.sleep(intervalMs)
+      } while (true)
+    } finally {
+      spinner.stop()
+    }
+    const pollErr = extractBusinessError(payload)
+    if (pollErr) {
+      logOperation(name, { ok: false, timeMs: Date.now() - t0 })
+      if (isUnsupportedDryrunBusinessError(pollErr)) {
+        error("ANALYTICS_AGENT_DRYRUN_UNSUPPORTED", "Remote service does not support strict dryrun async APIs", {
+          format,
+          aiMessage: dryrunUnsupportedAiMessage(),
+        })
+        return
+      }
+      error(pollErr.code, pollErr.message, { format })
+      return
+    }
+    logOperation(name, { ok: true, timeMs: Date.now() - t0 })
+    writeRenderedPayload(withAiMessage(payload, dryrunJobAiMessage(payload)), format, field)
+  } catch (err) {
+    logOperation(name, { ok: false, timeMs: Date.now() - t0 })
+    if (isHandledCliError(err)) return
+    if (isUnsupportedDryrunEndpoint(err)) {
+      error("ANALYTICS_AGENT_DRYRUN_UNSUPPORTED", "Remote service does not support strict dryrun async APIs", {
+        format,
+        aiMessage: dryrunUnsupportedAiMessage(),
+        extra: { request: err.request },
+      })
+      return
+    }
     error("ANALYTICS_AGENT_ERROR", err instanceof Error ? err.message : String(err), {
       format,
       ...(err instanceof AnalyticsHttpError ? { extra: { request: err.request } } : {}),
@@ -3417,14 +3730,30 @@ export function registerAnalyticsAgentCommand(cli: Argv<GlobalArgs>): void {
         return commandGroup(knowledge, "analytics-agent knowledge")
       })
       .command("service", "Check Analytics Agent service capability", (service) => {
-        service.command(
-          "enabled",
-          "Check whether the current tenant has Analytics Agent enabled",
-          (y) => y,
-          async (argv) => {
-            await executeAnalyticsCommand("analytics-agent service enabled", argv as Record<string, unknown>, ROUTES.datagptEnabled, {})
-          },
-        )
+        service
+          .command(
+            "enabled",
+            "Check whether the current tenant has Analytics Agent enabled",
+            (y) => y,
+            async (argv) => {
+              await executeAnalyticsCommand("analytics-agent service enabled", argv as Record<string, unknown>, ROUTES.datagptEnabled, {})
+            },
+          )
+          .command(
+            "strict-ready",
+            "Check whether strict dryrun and KB index commands are safe to use",
+            (y) =>
+              y
+                .option("domain-id", { type: "number", demandOption: true, describe: "Domain ID" })
+                .option("metric-id", { type: "number", array: true, describe: "Metric ID to check, can be repeated" })
+                .option("answer-builder-id", { type: "number", array: true, describe: "Answer builder ID to check, can be repeated" })
+                .option("include-content", { type: "boolean", default: false, describe: "Ask backend to include indexed content in the status response" })
+                .example("cz-cli analytics-agent service strict-ready --domain-id 195 --metric-id 568", "Check a known metric index before strict dryrun")
+                .example("cz-cli analytics-agent service strict-ready --domain-id 195", "Auto-sample one metric and one answer-builder in the domain"),
+            async (argv) => {
+              await runStrictReadyCommand(argv as Record<string, unknown>)
+            },
+          )
         return commandGroup(service, "analytics-agent service")
       })
       .command("session", "Manage Analytics Agent text2insight sessions", (session) => {
@@ -3541,6 +3870,61 @@ export function registerAnalyticsAgentCommand(cli: Argv<GlobalArgs>): void {
                 modelSettings,
               })
               await executeSessionRunCommand("analytics-agent session run", argvRec, body)
+            },
+          )
+          .command(
+            "dryrun",
+            "Run strict ask-data dryrun asynchronously and poll for the job result",
+            (y) =>
+              y
+                .option("domain-id", { type: "number", demandOption: true, describe: "Domain ID" })
+                .option("question", { type: "string", describe: "Question text" })
+                .option("query", { type: "string", describe: "Question text alias" })
+                .option("session-id", { type: "number", describe: "Session ID" })
+                .option("question-id", { type: "number", describe: "Question ID" })
+                .option("model", { type: "string", describe: "Model name" })
+                .option("model-identifier", { type: "string", describe: "AI Gateway model identifier" })
+                .option("language", { type: "string", describe: "Language hint, e.g. zh-CN" })
+                .option("validate-selected-candidate", { type: "boolean", describe: "Validate selected metric/answer-builder compatibility" })
+                .option("ask-data-scope", { type: "string", describe: "AskDataScope JSON object" })
+                .option("include-schema-evidence", { type: "boolean", describe: "Include related table schema evidence" })
+                .option("include-sample-values", { type: "boolean", describe: "Include column sample values in schema evidence" })
+                .option("sample-value-limit", { type: "number", describe: "Max sample values per column" })
+                .option("schema-evidence-table-column-limit", { type: "number", describe: "Max columns per schema evidence table" })
+                .option("wait", { type: "boolean", default: true, describe: "Poll until SUCCESS/FAILED/TIMEOUT/NOT_FOUND; use --no-wait to submit only" })
+                .option("interval-ms", { type: "number", describe: "Polling interval in milliseconds" })
+                .option("timeout-ms", { type: "number", describe: "Polling timeout in milliseconds" }),
+            async (argv) => {
+              const argvRec = argv as Record<string, unknown>
+              const format = typeof argv.format === "string" ? argv.format : undefined
+              const question = optionalNonEmptyStringValue(argv.question, "--question", format ?? "json")
+                ?? optionalNonEmptyStringValue(argv.query, "--query", format ?? "json")
+              if (!question) {
+                handledError("USAGE_ERROR", "--question is required", { format })
+              }
+              let askDataScope: Record<string, unknown> | undefined
+              try {
+                askDataScope = parseOptionalJsonObject(typeof argv["ask-data-scope"] === "string" ? argv["ask-data-scope"] : undefined, "--ask-data-scope")
+              } catch (err) {
+                handledError("USAGE_ERROR", err instanceof Error ? err.message : String(err), { format })
+              }
+              const body = mergeBody({}, {
+                domainId: argv["domain-id"],
+                sessionId: positiveIntegerValue(argv["session-id"], "--session-id", format ?? "json"),
+                questionId: positiveIntegerValue(argv["question-id"], "--question-id", format ?? "json"),
+                question,
+                query: argv.query,
+                model: optionalNonEmptyStringValue(argv.model, "--model", format ?? "json"),
+                modelIdentifier: optionalNonEmptyStringValue(argv["model-identifier"], "--model-identifier", format ?? "json"),
+                language: optionalNonEmptyStringValue(argv.language, "--language", format ?? "json"),
+                validateSelectedCandidate: argv["validate-selected-candidate"],
+                askDataScope,
+                includeSchemaEvidence: argv["include-schema-evidence"],
+                includeSampleValues: argv["include-sample-values"],
+                sampleValueLimit: positiveIntegerValue(argv["sample-value-limit"], "--sample-value-limit", format ?? "json"),
+                schemaEvidenceTableColumnLimit: positiveIntegerValue(argv["schema-evidence-table-column-limit"], "--schema-evidence-table-column-limit", format ?? "json"),
+              })
+              await executeSessionDryrunCommand("analytics-agent session dryrun", argvRec, body)
             },
           )
           .command(

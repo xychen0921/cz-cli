@@ -129,6 +129,7 @@ const noProfileCases = [
   ["analytics-agent", "domain", "prompt", "set", "1", "--prompt", "demo"],
   ["analytics-agent", "domain", "prompt", "clear", "1"],
   ["analytics-agent", "service", "enabled"],
+  ["analytics-agent", "service", "strict-ready", "--domain-id", "1", "--metric-id", "1"],
   ["analytics-agent", "table", "semantics", "list", "1"],
   ["analytics-agent", "table", "semantics", "get", "1", "1"],
   ["analytics-agent", "table", "semantics", "set", "1", "1", "--description", "demo"],
@@ -139,6 +140,7 @@ const noProfileCases = [
   ["analytics-agent", "column", "virtual", "delete", "1", "1"],
   ["analytics-agent", "session", "create", "--domain-id", "1"],
   ["analytics-agent", "session", "run", "--domain-id", "1", "--session-id", "1"],
+  ["analytics-agent", "session", "dryrun", "--domain-id", "1", "--question", "demo", "--no-wait"],
   ["analytics-agent", "session", "result", "1"],
   ["analytics-agent", "session", "stop", "1", "1"],
 ] as const
